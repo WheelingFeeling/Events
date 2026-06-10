@@ -53,7 +53,8 @@ jobs:
           python src/build_feed.py \
             --output public/wheeling-events.ics \
             --debug \
-            --dump-links public/discovered-links.txt
+            --dump-links public/discovered-links.txt \
+            --dump-skipped public/skipped-events.txt
 
       - name: Add simple index page
         run: |
@@ -66,8 +67,11 @@ jobs:
             </head>
             <body>
               <h1>Wheeling Events Feed</h1>
-              <p><a href="./wheeling-events.ics">Calendar feed</a></p>
-              <p><a href="./discovered-links.txt">Discovered event links</a></p>
+              <ul>
+                <li><a href="./wheeling-events.ics">Calendar feed</a></li>
+                <li><a href="./discovered-links.txt">Discovered event links</a></li>
+                <li><a href="./skipped-events.txt">Skipped events debug log</a></li>
+              </ul>
             </body>
           </html>
           EOF
