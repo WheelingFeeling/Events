@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import textwrap
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from html import unescape
@@ -48,11 +49,16 @@ WEELUNK_EVENTS_URL = os.getenv(
 )
 USER_AGENT = os.getenv(
     "FEED_USER_AGENT",
-    "wheeling-events-feed/1.6 (+https://github.com/yourname/wheeling-events-feed)",
+    "wheeling-events-feed/1.8 (+https://github.com/yourname/wheeling-events-feed)",
 )
 MAX_SITEMAP_FILES = int(os.getenv("MAX_SITEMAP_FILES", "40"))
 MAX_LISTING_PAGES_PER_SOURCE = int(os.getenv("MAX_LISTING_PAGES_PER_SOURCE", "6"))
 DEFAULT_MAX_LINKS = int(os.getenv("MAX_EVENT_LINKS", "800"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
+FEED_TIMEOUT_SECONDS = int(os.getenv("FEED_TIMEOUT_SECONDS", "8"))
+DETAIL_TIMEOUT_SECONDS = int(os.getenv("DETAIL_TIMEOUT_SECONDS", "20"))
+REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "2"))
+ENABLE_CVB_FEED = os.getenv("ENABLE_CVB_FEED", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 MONTHS = (
     "January",
@@ -119,12 +125,14 @@ CATEGORY_SLUGS = [
     "virtual-events",
 ]
 DEFAULT_DISCOVERY_URLS = [
-    CVB_FEED_URL,
     CVB_BASE_URL,
     urljoin(CVB_BASE_URL, "events/"),
     urljoin(CVB_BASE_URL, "events/?embedded=true"),
     *[urljoin(CVB_BASE_URL, f"events/categories/{slug}/") for slug in CATEGORY_SLUGS],
 ]
+if ENABLE_CVB_FEED:
+    # Optional because /events/feed/ can be slow or blocked from GitHub Actions.
+    DEFAULT_DISCOVERY_URLS.insert(0, CVB_FEED_URL)
 CVB_DISCOVERY_URLS = [
     url.strip()
     for url in os.getenv("CVB_DISCOVERY_URLS", ",".join(DEFAULT_DISCOVERY_URLS)).split(",")
@@ -210,6 +218,19 @@ def clean_text(value: object) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def record_skip(skipped: list[str] | None, source: str, url: str, reason: str, detail: object = "") -> None:
+    """Collect parser skip diagnostics without failing the feed build."""
+    if skipped is None:
+        return
+    clean_detail = clean_text(detail)[:500].replace("\t", " ")
+    skipped.append("\t".join([source, url, reason, clean_detail]))
+
+
+def format_skip_log(skipped: Sequence[str]) -> str:
+    header = "source\turl\treason\tdetail"
+    return header + "\n" + "\n".join(skipped) + ("\n" if skipped else "")
+
+
 def visible_lines(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
@@ -249,14 +270,28 @@ def title_from_soup(soup: BeautifulSoup) -> str:
     return ""
 
 
-def request_text(url: str, *, timeout: int = 30) -> str | None:
-    try:
-        response = SESSION.get(url, timeout=timeout)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as exc:
-        print(f"Request failed: {url}: {exc}", file=sys.stderr)
-        return None
+def request_text(
+    url: str,
+    *,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    retries: int = REQUEST_RETRIES,
+    label: str = "Request",
+) -> str | None:
+    """Fetch text with short retries so one slow source cannot break the feed build."""
+    attempts = max(1, retries)
+    last_exc: requests.RequestException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = SESSION.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.text
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time_module.sleep(min(2.0 * attempt, 6.0))
+
+    print(f"{label} skipped after {attempts} attempt(s): {url}: {last_exc}", file=sys.stderr)
+    return None
 
 
 def is_cvb_url(url: str) -> bool:
@@ -335,7 +370,7 @@ def discover_links_from_html(html: str, base_url: str) -> list[str]:
 
 
 def discover_links_from_feed(feed_url: str) -> list[str]:
-    text = request_text(feed_url)
+    text = request_text(feed_url, timeout=FEED_TIMEOUT_SECONDS, retries=1, label="Feed request")
     if not text:
         return []
 
@@ -382,7 +417,7 @@ def discover_links_from_page(page_url: str, pages: int = MAX_LISTING_PAGES_PER_S
         if candidate in seen_listing_pages:
             continue
         seen_listing_pages.add(candidate)
-        text = request_text(candidate)
+        text = request_text(candidate, timeout=REQUEST_TIMEOUT_SECONDS, label="Listing page request")
         if not text:
             continue
         add_unique(links, discover_links_from_html(text, candidate))
@@ -401,7 +436,7 @@ def discover_links_from_page(page_url: str, pages: int = MAX_LISTING_PAGES_PER_S
     for candidate in listing_pages_to_follow[:pages]:
         if candidate in seen_listing_pages:
             continue
-        text = request_text(candidate)
+        text = request_text(candidate, timeout=REQUEST_TIMEOUT_SECONDS, label="Listing page request")
         if text:
             add_unique(links, discover_links_from_html(text, candidate))
     return links
@@ -417,7 +452,7 @@ def discover_links_from_sitemaps(debug: bool = False) -> list[str]:
         if sitemap_url in seen_sitemaps:
             continue
         seen_sitemaps.add(sitemap_url)
-        text = request_text(sitemap_url, timeout=20)
+        text = request_text(sitemap_url, timeout=REQUEST_TIMEOUT_SECONDS, retries=1, label="Sitemap request")
         if not text or "<" not in text:
             continue
         try:
@@ -451,7 +486,7 @@ def discover_links_from_wp_search(debug: bool = False) -> list[str]:
                 params += "&subtype=any"
             url = endpoint + params
             try:
-                response = SESSION.get(url, timeout=25)
+                response = SESSION.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
                 if response.status_code in {400, 401, 403, 404}:
                     break
                 response.raise_for_status()
@@ -805,7 +840,7 @@ def type_includes_event(value: Any) -> bool:
     return False
 
 
-def parse_schema_events(soup: BeautifulSoup, url: str, tz_name: str, days_ahead: int) -> list[CalendarEvent]:
+def parse_schema_events(soup: BeautifulSoup, url: str, tz_name: str, days_ahead: int, skipped: list[str] | None = None) -> list[CalendarEvent]:
     events: list[CalendarEvent] = []
     today = datetime.now(get_tz(tz_name)).date()
     horizon = today + timedelta(days=days_ahead)
@@ -823,7 +858,14 @@ def parse_schema_events(soup: BeautifulSoup, url: str, tz_name: str, days_ahead:
             title = clean_text(obj.get("name"))
             start = parse_datetime(obj.get("startDate"), tz_name)
             end = parse_datetime(obj.get("endDate"), tz_name) if obj.get("endDate") else None
-            if not title or not start or not (today <= start.date() <= horizon):
+            if not title:
+                record_skip(skipped, "cvb-jsonld", url, "missing title", obj.get("@id") or obj)
+                continue
+            if not start:
+                record_skip(skipped, "cvb-jsonld", url, "missing startDate", title)
+                continue
+            if not (today <= start.date() <= horizon):
+                record_skip(skipped, "cvb-jsonld", url, "outside date window", f"{title} | {start.date().isoformat()}")
                 continue
             if not end:
                 end = start + timedelta(hours=2)
@@ -950,19 +992,17 @@ def extract_lineup_instances(
     return events
 
 
-def parse_cvb_detail_event(url: str, days_ahead: int, tz_name: str, debug: bool = False) -> list[CalendarEvent]:
-    try:
-        response = SESSION.get(url, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"Event detail request failed: {url}: {exc}", file=sys.stderr)
+def parse_cvb_detail_event(url: str, days_ahead: int, tz_name: str, debug: bool = False, skipped: list[str] | None = None) -> list[CalendarEvent]:
+    html = request_text(url, timeout=DETAIL_TIMEOUT_SECONDS, retries=1, label="Event detail request")
+    if not html:
+        record_skip(skipped, "cvb", url, "request failed or timed out")
         return []
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    schema_events = parse_schema_events(soup, url, tz_name, days_ahead)
+    soup = BeautifulSoup(html, "html.parser")
+    schema_events = parse_schema_events(soup, url, tz_name, days_ahead, skipped=skipped)
 
     title = title_from_soup(soup)
-    lines = visible_lines(response.text)
+    lines = visible_lines(html)
     text = "\n".join(lines)
     top_text = "\n".join(lines[:100])
     date_range = parse_date_range(top_text, tz_name) or parse_date_range(text[:7000], tz_name)
@@ -970,6 +1010,13 @@ def parse_cvb_detail_event(url: str, days_ahead: int, tz_name: str, debug: bool 
         if schema_events:
             debug_print(debug, f"Parsed via JSON-LD only: {url} -> {len(schema_events)} event(s)")
             return schema_events
+        missing = []
+        if not title:
+            missing.append("title")
+        if not date_range:
+            missing.append("date/date range")
+        reason = "missing " + " and ".join(missing) if missing else "unparsed page"
+        record_skip(skipped, "cvb", url, reason, top_text[:1000])
         debug_print(debug, f"Skipped: {url} | title={bool(title)} date_range={bool(date_range)}")
         return []
 
@@ -1004,11 +1051,13 @@ def parse_cvb_detail_event(url: str, days_ahead: int, tz_name: str, debug: bool 
     # JSON-LD can save a one-off event if page text parsing did not produce anything.
     if not events and schema_events:
         return schema_events
+    if not events:
+        record_skip(skipped, "cvb", url, "date parsed but no calendar instances created", top_text[:1000])
     debug_print(debug, f"Parsed: {url} -> {len(events)} event(s)")
     return events
 
 
-def fetch_cvb_events(days_ahead: int, tz_name: str, max_links: int, debug: bool = False) -> list[CalendarEvent]:
+def fetch_cvb_events(days_ahead: int, tz_name: str, max_links: int, debug: bool = False, skipped: list[str] | None = None) -> list[CalendarEvent]:
     links = discover_cvb_event_links(max_links=max_links, debug=debug)
     if not links:
         print("No Visit Wheeling event links discovered.", file=sys.stderr)
@@ -1018,7 +1067,7 @@ def fetch_cvb_events(days_ahead: int, tz_name: str, max_links: int, debug: bool 
     events: list[CalendarEvent] = []
     for idx, link in enumerate(links, start=1):
         debug_print(debug, f"[{idx}/{len(links)}] {link}")
-        events.extend(parse_cvb_detail_event(link, days_ahead, tz_name, debug=debug))
+        events.extend(parse_cvb_detail_event(link, days_ahead, tz_name, debug=debug, skipped=skipped))
     return events
 
 
@@ -1069,10 +1118,10 @@ def first_future_date(text: str, tz_name: str, days_ahead: int) -> datetime | No
     return sorted(candidates)[0]
 
 
-def fetch_weelunk_article_events(days_ahead: int, tz_name: str, debug: bool = False) -> list[CalendarEvent]:
+def fetch_weelunk_article_events(days_ahead: int, tz_name: str, debug: bool = False, skipped: list[str] | None = None) -> list[CalendarEvent]:
     """Best-effort fallback for Weelunk articles."""
     try:
-        response = SESSION.get(WEELUNK_EVENTS_URL, timeout=30)
+        response = SESSION.get(WEELUNK_EVENTS_URL, timeout=DETAIL_TIMEOUT_SECONDS)
         response.raise_for_status()
     except requests.RequestException as exc:
         print(f"Weelunk page request failed: {exc}", file=sys.stderr)
@@ -1084,7 +1133,7 @@ def fetch_weelunk_article_events(days_ahead: int, tz_name: str, debug: bool = Fa
 
     for url in article_links:
         try:
-            article_response = SESSION.get(url, timeout=30)
+            article_response = SESSION.get(url, timeout=DETAIL_TIMEOUT_SECONDS)
             article_response.raise_for_status()
         except requests.RequestException:
             continue
@@ -1094,6 +1143,13 @@ def fetch_weelunk_article_events(days_ahead: int, tz_name: str, debug: bool = Fa
         body = clean_text(soup.get_text(" "))
         start = first_future_date(f"{title}\n{body}", tz_name, days_ahead)
         if not title or not start:
+            missing = []
+            if not title:
+                missing.append("title")
+            if not start:
+                missing.append("future date")
+            reason = "missing " + " and ".join(missing) if missing else "unparsed article"
+            record_skip(skipped, "weelunk", url, reason, text[:1000])
             debug_print(debug, f"Skipped Weelunk: {url} | title={bool(title)} start={bool(start)}")
             continue
 
@@ -1247,6 +1303,7 @@ def main() -> int:
     parser.add_argument("--max-links", type=int, default=DEFAULT_MAX_LINKS, help="Maximum Visit Wheeling detail links to crawl")
     parser.add_argument("--debug", action="store_true", help="Print discovery, parsing, and skipped-page diagnostics")
     parser.add_argument("--dump-links", default="", help="Optional path to write discovered Visit Wheeling event URLs")
+    parser.add_argument("--dump-skipped", default="", help="Optional path to write pages/events skipped during parsing with reasons")
     parser.add_argument(
         "--source",
         choices=("auto", "cvb", "weelunk"),
@@ -1257,6 +1314,7 @@ def main() -> int:
 
     events: list[CalendarEvent] = []
     discovered_links: list[str] = []
+    skipped: list[str] = []
 
     if args.source in ("auto", "cvb"):
         discovered_links = discover_cvb_event_links(max_links=args.max_links, debug=args.debug)
@@ -1270,10 +1328,15 @@ def main() -> int:
             debug_print(args.debug, f"Discovered {len(discovered_links)} Visit Wheeling event detail links")
             for idx, link in enumerate(discovered_links, start=1):
                 debug_print(args.debug, f"[{idx}/{len(discovered_links)}] {link}")
-                events.extend(parse_cvb_detail_event(link, args.days, args.timezone, debug=args.debug))
+                events.extend(parse_cvb_detail_event(link, args.days, args.timezone, debug=args.debug, skipped=skipped))
 
     if args.source == "weelunk" or (args.source == "auto" and not events):
-        events.extend(fetch_weelunk_article_events(args.days, args.timezone, debug=args.debug))
+        events.extend(fetch_weelunk_article_events(args.days, args.timezone, debug=args.debug, skipped=skipped))
+
+    if args.dump_skipped:
+        skipped_path = resolve_output_path(args.dump_skipped)
+        write_text_file(skipped_path, format_skip_log(skipped))
+        debug_print(args.debug, f"Wrote skipped-event diagnostics to {skipped_path}")
 
     events = dedupe_events(events)
     output_path = resolve_output_path(args.output)
@@ -1282,6 +1345,8 @@ def main() -> int:
     print(f"Wrote {len(events)} events to {output_path}")
     if args.dump_links:
         print(f"Discovered {len(discovered_links)} Visit Wheeling links")
+    if args.dump_skipped:
+        print(f"Logged {len(skipped)} skipped/parsing diagnostics")
     if not events:
         print("No events found. Run with --debug and --dump-links debug-links.txt to inspect the drop-off.", file=sys.stderr)
     return 0
