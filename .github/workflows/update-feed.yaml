@@ -1,10 +1,13 @@
+```yaml
 name: Update Wheeling Events Feed
 
 on:
   workflow_dispatch:
   schedule:
-    # Daily at 5:10 AM Eastern during standard time / 6:10 AM Eastern during daylight time.
-    - cron: "10 10 * * *"
+    # Runs daily at 10:17 AM UTC.
+    # That is 6:17 AM Eastern during daylight saving time
+    # and 5:17 AM Eastern during standard time.
+    - cron: "17 10 * * *"
 
 permissions:
   contents: read
@@ -15,9 +18,20 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+  # Scraper behavior
+  ENABLE_CVB_FEED: "0"
+  REQUEST_TIMEOUT_SECONDS: "30"
+  DETAIL_TIMEOUT_SECONDS: "45"
+  REQUEST_RETRIES: "3"
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -26,28 +40,47 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Build ICS feed
-        run: python src/build_feed.py --output public/wheeling-events.ics
+      - name: Build calendar feed
+        run: |
+          mkdir -p public
+          python src/build_feed.py \
+            --output public/wheeling-events.ics \
+            --debug \
+            --dump-links public/discovered-links.txt
 
-      - name: Add nojekyll marker
-        run: touch public/.nojekyll
+      - name: Add simple index page
+        run: |
+          cat > public/index.html <<'EOF'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <title>Wheeling Events Feed</title>
+            </head>
+            <body>
+              <h1>Wheeling Events Feed</h1>
+              <p><a href="./wheeling-events.ics">Calendar feed</a></p>
+              <p><a href="./discovered-links.txt">Discovered event links</a></p>
+            </body>
+          </html>
+          EOF
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+```
