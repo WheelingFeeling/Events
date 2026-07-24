@@ -10,7 +10,9 @@ import json
 import re
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -18,6 +20,7 @@ SOURCE_URL = "https://wheelingcvb.com/events/"
 LOCAL_TZ = ZoneInfo("America/New_York")
 USER_AGENT = "WheelingEventsCalendar/1.0 (+GitHub Actions)"
 MAX_ALL_DAY_SPAN_DAYS = 14
+LOCATION_WORKERS = 8
 
 
 def fetch(url: str) -> str:
@@ -39,6 +42,80 @@ def extract_events(page: str) -> list[dict]:
 def strip_markup(value: str) -> str:
     value = re.sub(r"<[^>]+>", " ", value or "")
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+class VisibleTextParser(HTMLParser):
+    """Collect readable text chunks while ignoring scripts and styles."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"script", "style", "noscript", "svg"}:
+            self.hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript", "svg"} and self.hidden_depth:
+            self.hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_depth:
+            value = re.sub(r"\s+", " ", html.unescape(data)).strip()
+            if value:
+                self.parts.append(value)
+
+
+def extract_location(detail_page: str) -> str:
+    """Find the first venue/address block, excluding the CVB footer address."""
+    parser = VisibleTextParser()
+    parser.feed(detail_page)
+    parts = parser.parts
+    city_zip = re.compile(r"^[A-Za-z .'-]+,\s*(?:WV|OH|PA)\s+\d{5}(?:-\d{4})?$", re.I)
+    street = re.compile(
+        r"^(?:\d+|P\.?\s*O\.?\s+Box\b).*(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|"
+        r"Lane|Ln|Boulevard|Blvd|Highway|Hwy|Way|Place|Pl|Pike|Route|Square)\b",
+        re.I,
+    )
+
+    for index, value in enumerate(parts):
+        if not city_zip.match(value):
+            continue
+        previous = parts[max(0, index - 4) : index]
+        street_index = next(
+            (i for i in range(len(previous) - 1, -1, -1) if street.search(previous[i])),
+            None,
+        )
+        if street_index is None:
+            continue
+        street_value = previous[street_index]
+        if street_value.startswith("1401 Main Street"):
+            continue
+        venue = previous[street_index - 1] if street_index > 0 else ""
+        if venue and not re.search(r"\d{5}|https?://|^\d{3}[- )]", venue):
+            return ", ".join((venue, street_value, value))
+        return ", ".join((street_value, value))
+    return ""
+
+
+def fetch_locations(urls: set[str]) -> dict[str, str]:
+    locations: dict[str, str] = {}
+
+    def get_one(url: str) -> tuple[str, str]:
+        try:
+            return url, extract_location(fetch(url))
+        except Exception as exc:
+            print(f"Location lookup skipped for {url}: {exc}", file=sys.stderr)
+            return url, ""
+
+    with ThreadPoolExecutor(max_workers=LOCATION_WORKERS) as executor:
+        futures = [executor.submit(get_one, url) for url in sorted(urls)]
+        for future in as_completed(futures):
+            url, location = future.result()
+            if location:
+                locations[url] = location
+    return locations
 
 
 def template_field(template: str, class_name: str) -> str:
@@ -112,7 +189,9 @@ def fold(line: str) -> str:
     return "\r\n ".join(chunks)
 
 
-def make_event(item: dict, generated_at: datetime) -> list[str] | None:
+def make_event(
+    item: dict, generated_at: datetime, locations: dict[str, str]
+) -> list[str] | None:
     start_date = datetime.strptime(item["startDate"], "%m/%d/%Y").date()
     end_date = datetime.strptime(item.get("endDate") or item["startDate"], "%m/%d/%Y").date()
     template = item.get("template", "")
@@ -171,6 +250,11 @@ def make_event(item: dict, generated_at: datetime) -> list[str] | None:
     lines.extend(
         [
             f"DESCRIPTION:{ics_escape(chr(10).join(x for x in description_parts if x))}",
+            *(
+                [f"LOCATION:{ics_escape(locations[event_url])}"]
+                if locations.get(event_url)
+                else []
+            ),
             f"URL:{event_url}",
             "STATUS:CONFIRMED",
             "TRANSP:TRANSPARENT",
@@ -180,7 +264,7 @@ def make_event(item: dict, generated_at: datetime) -> list[str] | None:
     return lines
 
 
-def build(page: str) -> tuple[str, int]:
+def build(page: str, include_locations: bool = False) -> tuple[str, int]:
     raw_events = extract_events(page)
     generated_at = datetime.now(tz=ZoneInfo("UTC"))
     unique: dict[tuple[str, str], dict] = {}
@@ -194,6 +278,11 @@ def build(page: str) -> tuple[str, int]:
             datetime.strptime(x["startDate"], "%m/%d/%Y").date(),
             x.get("title", ""),
         ),
+    )
+    locations = (
+        fetch_locations({template_url(item.get("template", "")) for item in ordered})
+        if include_locations
+        else {}
     )
 
     lines = [
@@ -209,7 +298,7 @@ def build(page: str) -> tuple[str, int]:
     ]
     included = 0
     for item in ordered:
-        event_lines = make_event(item, generated_at)
+        event_lines = make_event(item, generated_at, locations)
         if event_lines is not None:
             lines.extend(event_lines)
             included += 1
@@ -221,10 +310,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, help="Use saved HTML instead of downloading the page")
     parser.add_argument("--output", type=Path, default=Path("docs/wheeling-events.ics"))
+    parser.add_argument(
+        "--no-locations",
+        action="store_true",
+        help="Skip detail-page venue and address lookups",
+    )
     args = parser.parse_args()
     try:
         page = args.input.read_text(encoding="utf-8", errors="replace") if args.input else fetch(SOURCE_URL)
-        calendar, count = build(page)
+        calendar, count = build(page, include_locations=not args.no_locations and not args.input)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(calendar, encoding="utf-8", newline="")
         print(f"Wrote {count} events to {args.output}")

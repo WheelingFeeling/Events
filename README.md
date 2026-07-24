@@ -26,6 +26,8 @@ future GitHub updates flow into iOS.
 - GitHub checks the event page daily at 6:17 a.m. Eastern during daylight-saving time.
 - Each calendar event has a stable ID based on its source URL and occurrence date.
 - Changed titles, descriptions, or times update in place.
+- Venue names and street addresses are pulled from each event's detail page and stored in
+  the calendar's native `LOCATION` field, making the address tappable in iOS Calendar.
 - Events removed from the source disappear from the published feed.
 - Items without a listed ending time default to two hours.
 - Items without any listed time are published as all-day events.
