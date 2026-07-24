@@ -29,6 +29,8 @@ future GitHub updates flow into iOS.
 - Events removed from the source disappear from the published feed.
 - Items without a listed ending time default to two hours.
 - Items without any listed time are published as all-day events.
+- All-day listings spanning more than 14 days are omitted so multi-month exhibits and
+  seasonal promotions do not cover the iPhone calendar.
 
 The site publishes repeating activities as dated occurrences, so the feed preserves each
 published occurrence rather than inventing recurrence rules.

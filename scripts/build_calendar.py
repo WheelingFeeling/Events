@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 SOURCE_URL = "https://wheelingcvb.com/events/"
 LOCAL_TZ = ZoneInfo("America/New_York")
 USER_AGENT = "WheelingEventsCalendar/1.0 (+GitHub Actions)"
+MAX_ALL_DAY_SPAN_DAYS = 14
 
 
 def fetch(url: str) -> str:
@@ -111,7 +112,7 @@ def fold(line: str) -> str:
     return "\r\n ".join(chunks)
 
 
-def make_event(item: dict, generated_at: datetime) -> list[str]:
+def make_event(item: dict, generated_at: datetime) -> list[str] | None:
     start_date = datetime.strptime(item["startDate"], "%m/%d/%Y").date()
     end_date = datetime.strptime(item.get("endDate") or item["startDate"], "%m/%d/%Y").date()
     template = item.get("template", "")
@@ -120,6 +121,13 @@ def make_event(item: dict, generated_at: datetime) -> list[str]:
     clock_text = template_field(template, "post-thumbnail-time")
     recurrence = template_field(template, "post-thumbnail-recurrence")
     start_clock, end_clock = parse_clock(clock_text)
+
+    # Long-running exhibits and seasonal promotions otherwise appear as
+    # continuous all-day bars across weeks or months in iOS Calendar.
+    span_days = (end_date - start_date).days + 1
+    if start_clock is None and span_days > MAX_ALL_DAY_SPAN_DAYS:
+        return None
+
     uid_seed = f"{event_url}|{start_date.isoformat()}"
     uid = hashlib.sha256(uid_seed.encode()).hexdigest()[:32] + "@wheeling-events"
 
@@ -199,10 +207,14 @@ def build(page: str) -> tuple[str, int]:
         "X-PUBLISHED-TTL:PT12H",
         "REFRESH-INTERVAL;VALUE=DURATION:PT12H",
     ]
+    included = 0
     for item in ordered:
-        lines.extend(make_event(item, generated_at))
+        event_lines = make_event(item, generated_at)
+        if event_lines is not None:
+            lines.extend(event_lines)
+            included += 1
     lines.append("END:VCALENDAR")
-    return "\r\n".join(fold(line) for line in lines) + "\r\n", len(ordered)
+    return "\r\n".join(fold(line) for line in lines) + "\r\n", included
 
 
 def main() -> int:
