@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#132f4c">
+  <title>Wheeling WV Community Events Calendar</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --navy: #132f4c;
+      --blue: #1769aa;
+      --paper: #f4f7fa;
+      --ink: #17212b;
+      --card: #fff;
+      --line: #d8e1e8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 17px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(720px, calc(100% - 32px)); margin: 48px auto; }
+    .card {
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      box-shadow: 0 12px 35px rgb(19 47 76 / 10%);
+    }
+    header {
+      padding: 34px;
+      color: white;
+      background: linear-gradient(135deg, var(--navy), var(--blue));
+    }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 7vw, 42px); line-height: 1.1; }
+    header p { margin: 0; opacity: .9; }
+    section { padding: 28px 34px; }
+    .buttons { display: grid; gap: 12px; margin: 22px 0; }
+    .button {
+      display: block;
+      padding: 14px 18px;
+      border: 0;
+      border-radius: 12px;
+      background: var(--blue);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      text-align: center;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .secondary { background: var(--navy); }
+    .plain { color: var(--blue); background: transparent; border: 1px solid var(--line); }
+    ol { padding-left: 22px; }
+    details { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); }
+    summary { cursor: pointer; font-weight: 700; }
+    .small { color: #526170; font-size: 14px; }
+    #copy-status { min-height: 24px; text-align: center; }
+    @media (prefers-color-scheme: dark) {
+      :root { --paper: #0e151c; --ink: #edf4f8; --card: #17212b; --line: #344451; }
+      .small { color: #afbec9; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <article class="card">
+      <header>
+        <h1>Wheeling WV Events</h1>
+        <p>A free community calendar refreshed every day.</p>
+      </header>
+      <section>
+        <p>Subscribe once and new or changed events will automatically appear in your calendar. Completed events remain available for one year.</p>
+        <div class="buttons">
+          <a class="button" href="webcal://wheelingfeeling.github.io/Events/wheeling-events.ics">Subscribe on iPhone or Mac</a>
+          <button class="button secondary" type="button" id="copy">Copy secure calendar URL</button>
+          <a class="button plain" type="text/calendar" href="./wheeling-events.ics">Download a calendar snapshot</a>
+        </div>
+        <div id="copy-status" role="status" aria-live="polite"></div>
+
+        <details>
+          <summary>Most reliable iPhone setup</summary>
+          <ol>
+            <li>Tap <strong>Copy secure calendar URL</strong> above.</li>
+            <li>Open <strong>Settings → Apps → Calendar → Calendar Accounts</strong>.</li>
+            <li>Tap <strong>Add Account → Other → Add Subscribed Calendar</strong>.</li>
+            <li>Paste the URL and tap <strong>Next</strong>, then <strong>Save</strong>.</li>
+          </ol>
+        </details>
+
+        <details>
+          <summary>Google Calendar or Outlook</summary>
+          <p>Use your calendar's <strong>Subscribe from URL</strong> or <strong>Add calendar from internet</strong> option and paste the secure URL.</p>
+        </details>
+
+        <p class="small">This is a read-only community feed sourced from Visit Wheeling. Always confirm important details with the event organizer.</p>
+      </section>
+    </article>
+  </main>
+  <script>
+    const feed = "https://wheelingfeeling.github.io/Events/wheeling-events.ics";
+    document.querySelector("#copy").addEventListener("click", async () => {
+      const status = document.querySelector("#copy-status");
+      try {
+        await navigator.clipboard.writeText(feed);
+        status.textContent = "Secure calendar URL copied.";
+      } catch {
+        window.prompt("Copy this secure calendar URL:", feed);
+      }
+    });
+  </script>
+</body>
+</html>

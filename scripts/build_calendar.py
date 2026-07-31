@@ -9,6 +9,7 @@ import html
 import json
 import re
 import sys
+import time as time_module
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
@@ -20,13 +21,29 @@ SOURCE_URL = "https://wheelingcvb.com/events/"
 LOCAL_TZ = ZoneInfo("America/New_York")
 USER_AGENT = "WheelingEventsCalendar/1.0 (+GitHub Actions)"
 MAX_ALL_DAY_SPAN_DAYS = 14
+HISTORY_RETENTION_DAYS = 365
 LOCATION_WORKERS = 8
 
 
-def fetch(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=45) as response:
-        return response.read().decode("utf-8", errors="replace")
+def fetch(url: str, attempts: int = 3) -> str:
+    """Download a page with small retries for transient hosting failures."""
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=45) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                time_module.sleep(attempt)
+    raise RuntimeError(f"Unable to download {url}: {last_error}")
 
 
 def extract_events(page: str) -> list[dict]:
@@ -115,6 +132,7 @@ def fetch_locations(urls: set[str]) -> dict[str, str]:
             url, location = future.result()
             if location:
                 locations[url] = location
+    print(f"Found locations for {len(locations)} of {len(urls)} detail pages")
     return locations
 
 
@@ -189,6 +207,108 @@ def fold(line: str) -> str:
     return "\r\n ".join(chunks)
 
 
+def unfold_calendar(text: str) -> list[str]:
+    """Return logical iCalendar lines with folded continuations restored."""
+    logical: list[str] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.startswith((" ", "\t")) and logical:
+            logical[-1] += line[1:]
+        elif line:
+            logical.append(line)
+    return logical
+
+
+def event_value(event: list[str], property_name: str) -> tuple[str, str] | None:
+    for line in event:
+        key, separator, value = line.partition(":")
+        if separator and key.split(";", 1)[0] == property_name:
+            return key, value
+    return None
+
+
+def event_uid_key(event: list[str]) -> str:
+    uid = event_value(event, "UID")
+    return uid[1].split("@", 1)[0] if uid else ""
+
+
+def parse_calendar_datetime(key: str, value: str) -> datetime:
+    if ";VALUE=DATE" in key:
+        parsed_date = datetime.strptime(value, "%Y%m%d").date()
+        return datetime.combine(parsed_date, time.min, LOCAL_TZ).astimezone(
+            ZoneInfo("UTC")
+        )
+    if value.endswith("Z"):
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=ZoneInfo("UTC")
+        )
+    parsed = datetime.strptime(value, "%Y%m%dT%H%M%S")
+    if "TZID=America/New_York" in key or "TZID=" not in key:
+        return parsed.replace(tzinfo=LOCAL_TZ).astimezone(ZoneInfo("UTC"))
+    raise ValueError(f"Unsupported historical timezone in {key}")
+
+
+def normalize_historical_event(event: list[str]) -> list[str]:
+    """Migrate an older event to UTC and the current UID namespace."""
+    normalized: list[str] = []
+    for line in event:
+        key, separator, value = line.partition(":")
+        if not separator:
+            normalized.append(line)
+            continue
+        base_key = key.split(";", 1)[0]
+        if base_key in {"DTSTART", "DTEND"} and ";VALUE=DATE" not in key:
+            moment = parse_calendar_datetime(key, value)
+            normalized.append(f"{base_key}:{moment.strftime('%Y%m%dT%H%M%SZ')}")
+        elif base_key == "UID":
+            normalized.append(
+                f"UID:{value.split('@', 1)[0]}@wheelingfeeling.github.io"
+            )
+        else:
+            normalized.append(line)
+    return normalized
+
+
+def load_historical_events(path: Path, now: datetime) -> list[list[str]]:
+    """Load completed events from the prior feed for a rolling one-year archive."""
+    if not path.exists():
+        return []
+    try:
+        logical = unfold_calendar(path.read_text(encoding="utf-8", errors="strict"))
+    except Exception as exc:
+        print(f"History skipped because the prior feed could not be read: {exc}")
+        return []
+
+    events: list[list[str]] = []
+    current: list[str] | None = None
+    for line in logical:
+        if line == "BEGIN:VEVENT":
+            current = [line]
+        elif current is not None:
+            current.append(line)
+            if line == "END:VEVENT":
+                events.append(current)
+                current = None
+
+    cutoff = now - timedelta(days=HISTORY_RETENTION_DAYS)
+    retained: list[list[str]] = []
+    for event in events:
+        try:
+            start_property = event_value(event, "DTSTART")
+            end_property = event_value(event, "DTEND")
+            if not start_property or not end_property:
+                continue
+            starts = parse_calendar_datetime(*start_property)
+            ends = parse_calendar_datetime(*end_property)
+            is_all_day = ";VALUE=DATE" in start_property[0]
+            if is_all_day and (ends - starts).days > MAX_ALL_DAY_SPAN_DAYS:
+                continue
+            if cutoff <= ends <= now:
+                retained.append(normalize_historical_event(event))
+        except Exception as exc:
+            print(f"Historical event skipped: {exc}", file=sys.stderr)
+    return retained
+
+
 def make_event(
     item: dict, generated_at: datetime, locations: dict[str, str]
 ) -> list[str] | None:
@@ -208,7 +328,10 @@ def make_event(
         return None
 
     uid_seed = f"{event_url}|{start_date.isoformat()}"
-    uid = hashlib.sha256(uid_seed.encode()).hexdigest()[:32] + "@wheeling-events"
+    uid = (
+        hashlib.sha256(uid_seed.encode()).hexdigest()[:32]
+        + "@wheelingfeeling.github.io"
+    )
 
     categories = ", ".join(strip_markup(x).replace("-", " ").title() for x in item.get("categories", []))
     description_parts = [strip_markup(item.get("description", ""))]
@@ -222,6 +345,7 @@ def make_event(
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{generated_at.strftime('%Y%m%dT%H%M%SZ')}",
+        f"LAST-MODIFIED:{generated_at.strftime('%Y%m%dT%H%M%SZ')}",
         f"SUMMARY:{ics_escape(title)}",
     ]
 
@@ -240,10 +364,12 @@ def make_event(
                 ends += timedelta(days=1)
         else:
             ends = starts + timedelta(hours=2)
+        starts_utc = starts.astimezone(ZoneInfo("UTC"))
+        ends_utc = ends.astimezone(ZoneInfo("UTC"))
         lines.extend(
             [
-                f"DTSTART;TZID=America/New_York:{starts.strftime('%Y%m%dT%H%M%S')}",
-                f"DTEND;TZID=America/New_York:{ends.strftime('%Y%m%dT%H%M%S')}",
+                f"DTSTART:{starts_utc.strftime('%Y%m%dT%H%M%SZ')}",
+                f"DTEND:{ends_utc.strftime('%Y%m%dT%H%M%SZ')}",
             ]
         )
 
@@ -256,6 +382,7 @@ def make_event(
                 else []
             ),
             f"URL:{event_url}",
+            "CLASS:PUBLIC",
             "STATUS:CONFIRMED",
             "TRANSP:TRANSPARENT",
             "END:VEVENT",
@@ -264,7 +391,11 @@ def make_event(
     return lines
 
 
-def build(page: str, include_locations: bool = False) -> tuple[str, int]:
+def build(
+    page: str,
+    include_locations: bool = False,
+    historical_events: list[list[str]] | None = None,
+) -> tuple[str, int]:
     raw_events = extract_events(page)
     generated_at = datetime.now(tz=ZoneInfo("UTC"))
     unique: dict[tuple[str, str], dict] = {}
@@ -291,19 +422,34 @@ def build(page: str, include_locations: bool = False) -> tuple[str, int]:
         "PRODID:-//Wheeling Events Calendar//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
+        "NAME:Wheeling WV Events",
         "X-WR-CALNAME:Wheeling WV Events",
-        "X-WR-TIMEZONE:America/New_York",
+        f"SOURCE;VALUE=URI:{SOURCE_URL}",
         "X-PUBLISHED-TTL:PT12H",
         "REFRESH-INTERVAL;VALUE=DURATION:PT12H",
     ]
-    included = 0
+    current_events: list[list[str]] = []
     for item in ordered:
         event_lines = make_event(item, generated_at, locations)
         if event_lines is not None:
-            lines.extend(event_lines)
-            included += 1
+            current_events.append(event_lines)
+
+    current_keys = {event_uid_key(event) for event in current_events}
+    retained_history = [
+        event
+        for event in historical_events or []
+        if event_uid_key(event) and event_uid_key(event) not in current_keys
+    ]
+    for event in current_events:
+        lines.extend(event)
+    for event in retained_history:
+        lines.extend(event)
+    if retained_history:
+        print(f"Preserved {len(retained_history)} completed historical events")
+
     lines.append("END:VCALENDAR")
-    return "\r\n".join(fold(line) for line in lines) + "\r\n", included
+    total = len(current_events) + len(retained_history)
+    return "\r\n".join(fold(line) for line in lines) + "\r\n", total
 
 
 def main() -> int:
@@ -315,10 +461,25 @@ def main() -> int:
         action="store_true",
         help="Skip detail-page venue and address lookups",
     )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Do not preserve completed events from the prior calendar",
+    )
     args = parser.parse_args()
     try:
         page = args.input.read_text(encoding="utf-8", errors="replace") if args.input else fetch(SOURCE_URL)
-        calendar, count = build(page, include_locations=not args.no_locations and not args.input)
+        generated_at = datetime.now(tz=ZoneInfo("UTC"))
+        history = (
+            []
+            if args.no_history
+            else load_historical_events(args.output, generated_at)
+        )
+        calendar, count = build(
+            page,
+            include_locations=not args.no_locations and not args.input,
+            historical_events=history,
+        )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(calendar, encoding="utf-8", newline="")
         print(f"Wrote {count} events to {args.output}")
